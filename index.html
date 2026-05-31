@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QUANTUM CORE // MONOLITH v.10</title>
+    <link href="https://fonts.googleapis.com/css2?family=Audiowide&display=swap" rel="stylesheet">
+    <style>
+        :root { --neon: #00ffcc; --bg: #000; }
+        body { margin: 0; overflow: hidden; background: var(--bg); font-family: 'Audiowide', cursive; }
+
+        /* LAYERS */
+        #canvas-3d { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        #canvas-hud { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2; pointer-events: none; }
+
+        /* DEBUG VIDEO (Bottom Left) */
+        #webcam-feed {
+            position: absolute; bottom: 20px; left: 20px; width: 160px; height: 120px;
+            z-index: 5; border: 2px solid var(--neon); opacity: 0.8; transform: scaleX(-1);
+            border-radius: 4px; box-shadow: 0 0 20px var(--neon);
+        }
+
+        /* UI */
+        #ui {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10;
+            pointer-events: none; padding: 30px; display: flex; flex-direction: column; justify-content: space-between;
+        }
+
+        h1 { color: white; margin: 0; font-size: 3.5rem; text-shadow: 0 0 30px var(--neon); letter-spacing: 4px; }
+        .status-bar { 
+            background: rgba(0,0,0,0.9); border-left: 5px solid var(--neon); 
+            padding: 10px 25px; color: white; font-size: 1.2rem; display: inline-block; 
+            box-shadow: 0 0 20px rgba(0, 255, 204, 0.2);
+        }
+
+        /* CENTER POPUP */
+        #center-pop {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; display: none;
+        }
+        #center-text { 
+            font-size: 6rem; color: white; 
+            text-shadow: 0 0 60px currentColor; /* Glow matches text color */
+        }
+
+        /* GUIDE */
+        .controls {
+            align-self: flex-end; background: rgba(0,0,0,0.9); padding: 20px 40px; 
+            border: 1px solid #333; pointer-events: auto; margin-bottom: 20px; text-align: right;
+        }
+        .row { color: #ccc; margin-bottom: 8px; font-size: 1rem; }
+        .highlight { color: var(--neon); }
+
+        /* LOADER */
+        #loader {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000;
+            z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        button {
+            background: transparent; border: 2px solid var(--neon); color: var(--neon); 
+            padding: 15px 50px; font-size: 1.5rem; font-family: inherit; cursor: pointer; 
+            margin-top: 30px; transition: 0.3s;
+        }
+        button:hover { background: var(--neon); color: black; box-shadow: 0 0 50px var(--neon); }
+    </style>
+
+    <script type="importmap">
+        { "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/+esm"
+        }}
+    </script>
+</head>
+<body>
+
+    <div id="loader">
+        <h1 style="font-size: 4rem;">QUANTUM MONOLITH</h1>
+        <p style="color: #666; letter-spacing: 2px;">HIGH CONTRAST GEOMETRY ENGINE</p>
+        <button id="btn-start">INITIALIZE SYSTEM</button>
+        <p id="error-log" style="color: red; margin-top: 20px;"></p>
+    </div>
+
+    <div id="ui">
+        <div>
+            <h1>V.10 MONOLITH</h1>
+            <div id="status" class="status-bar">SYSTEM STANDBY</div>
+        </div>
+        
+        <div id="center-pop"><div id="center-text">GALAXY</div></div>
+
+        <div class="controls">
+            <div class="row">MOUSE: <span class="highlight">DRAG TO ROTATE</span></div>
+            <div class="row">2 HANDS: <span class="highlight">SPREAD TO ZOOM</span></div>
+            <div class="row">1 HAND: <span class="highlight">PINCH TO MORPH (8 SHAPES)</span></div>
+        </div>
+    </div>
+
+    <video id="webcam-feed" playsinline muted autoplay></video>
+    <canvas id="canvas-hud"></canvas>
+    <div id="canvas-3d"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- GLOBAL CONFIG ---
+        const CONFIG = {
+            count: 16000,
+            size: 0.28,
+            baseZoom: 55
+        };
+
+        const STATE = {
+            zoom: 55,
+            targetZoom: 55,
+            shapeIdx: 0,
+            pinchVal: 0,
+            isImploding: false,
+            mouse: { down:false, x:0, y:0, vx:0, vy:0 },
+            autoRotate: true
+        };
+
+        const DOM = {
+            vid: document.getElementById('webcam-feed'),
+            hud: document.getElementById('canvas-hud'),
+            ctx: document.getElementById('canvas-hud').getContext('2d'),
+            status: document.getElementById('status'),
+            loader: document.getElementById('loader'),
+            centerPop: document.getElementById('center-pop'),
+            centerText: document.getElementById('center-text'),
+            err: document.getElementById('error-log'),
+            btn: document.getElementById('btn-start')
+        };
+
+        // --- 1. THREE.JS ENGINE ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+        camera.position.z = CONFIG.baseZoom;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(0x000000); // Pitch Black
+        document.getElementById('canvas-3d').appendChild(renderer.domElement);
+
+        // --- 2. HIGH VISIBILITY TEXTURE ---
+        const cvs = document.createElement('canvas'); cvs.width=64; cvs.height=64;
+        const c = cvs.getContext('2d');
+        // Solid White Core
+        c.beginPath(); c.arc(32,32,10,0,Math.PI*2); c.fillStyle='white'; c.fill();
+        // Hard Glow
+        const g = c.createRadialGradient(32,32,10,32,32,32);
+        g.addColorStop(0,'rgba(255,255,255,0.8)'); g.addColorStop(1,'transparent');
+        c.fillStyle=g; c.fillRect(0,0,64,64);
+        const tex = new THREE.Texture(cvs); tex.needsUpdate = true;
+
+        const geo = new THREE.BufferGeometry();
+        const pos = new Float32Array(CONFIG.count*3);
+        const col = new Float32Array(CONFIG.count*3);
+        const physics = [];
+
+        for(let i=0; i<CONFIG.count; i++){
+            physics.push({ tx:0, ty:0, tz:0, vx:0, vy:0, vz:0 });
+            pos[i*3]=(Math.random()-0.5)*100;
+            pos[i*3+1]=(Math.random()-0.5)*100;
+            pos[i*3+2]=(Math.random()-0.5)*100;
+            col[i*3]=0; col[i*3+1]=1; col[i*3+2]=1; // Init Cyan
+        }
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+        const mat = new THREE.PointsMaterial({
+            size: CONFIG.size, map: tex, vertexColors: true,
+            blending: THREE.AdditiveBlending, depthWrite: false, transparent: true
+        });
+        const points = new THREE.Points(geo, mat);
+        scene.add(points);
+
+        // --- 3. SHAPE DEFINITIONS (8 SHAPES - 8 COLORS) ---
+        // Each shape returns the Target Position AND the Color Hex
+        const SHAPES = [
+            {
+                name: "GALAXY",
+                color: "#00f3ff", // Cyan
+                gen: (i) => {
+                    const arms=5, r=Math.pow(Math.random(),1.5)*35, a=(i%arms)*((Math.PI*2)/arms), s=r*0.4, f=(Math.random()-0.5)*(1+r*0.2);
+                    return {x:Math.cos(a+s)*r+f, y:(Math.random()-0.5)*5, z:Math.sin(a+s)*r+f};
+                }
+            },
+            {
+                name: "SATURN",
+                color: "#ffaa00", // Gold
+                gen: (i) => {
+                    // Split 70% Planet, 30% Ring
+                    if (i < CONFIG.count * 0.7) {
+                        // Planet Sphere
+                        const r=14, t=Math.random()*6.28, p=Math.acos(2*Math.random()-1);
+                        return {x:r*Math.sin(p)*Math.cos(t), y:r*Math.sin(p)*Math.sin(t), z:r*Math.cos(p)};
+                    } else {
+                        // Ring Disk
+                        const r=18 + Math.random()*12, t=Math.random()*6.28;
+                        return {x:r*Math.cos(t), y:(Math.random()-0.5)*1, z:r*Math.sin(t)};
+                    }
+                }
+            },
+            {
+                name: "DNA HELIX",
+                color: "#00ff00", // Neon Green
+                gen: (i) => {
+                    const t = (i/CONFIG.count)*Math.PI*30, r=9, off=(i%2===0)?0:Math.PI;
+                    return { x:Math.cos(t+off)*r, y:(i/CONFIG.count)*100 - 50, z:Math.sin(t+off)*r };
+                }
+            },
+            {
+                name: "HYPER CUBE",
+                color: "#ff00aa", // Hot Pink
+                gen: (i) => {
+                    const s=32; return {x:(Math.random()-0.5)*s, y:(Math.random()-0.5)*s, z:(Math.random()-0.5)*s};
+                }
+            },
+            {
+                name: "KLEIN BOTTLE",
+                color: "#ff3333", // Plasma Red
+                gen: (i) => {
+                    // Parametric Klein
+                    const u = Math.random() * Math.PI;
+                    const v = Math.random() * 2 * Math.PI;
+                    const r = 4 * (1 - Math.cos(u) / 2);
+                    let x, y, z;
+                    if (u < Math.PI) {
+                        x = 6 * Math.cos(u) * (1 + Math.sin(u)) + r * Math.cos(u) * Math.cos(v);
+                        y = 16 * Math.sin(u) + r * Math.sin(u) * Math.cos(v);
+                    } else {
+                        x = 6 * Math.cos(u) * (1 + Math.sin(u)) + r * Math.cos(v + Math.PI);
+                        y = 16 * Math.sin(u);
+                    }
+                    z = r * Math.sin(v);
+                    return { x: x*0.6, y: (y-10)*0.6, z: z*0.6 };
+                }
+            },
+            {
+                name: "TORUS",
+                color: "#9900ff", // Deep Violet
+                gen: (i) => {
+                    const u=Math.random()*6.28, v=Math.random()*6.28, R=18, r=6;
+                    return { x:(R+r*Math.cos(v))*Math.cos(u), y:(R+r*Math.cos(v))*Math.sin(u), z:r*Math.sin(v) };
+                }
+            },
+            {
+                name: "PYRAMID",
+                color: "#ffffff", // Pure White
+                gen: (i) => {
+                    // Tetrahedron-ish
+                    const h = 25;
+                    const y = (Math.random()-0.5) * h;
+                    const w = (1 - (y + h/2)/h) * 20; // Taper width
+                    const t = Math.random()*6.28;
+                    return { x: w*Math.cos(t), y: y, z: w*Math.sin(t) };
+                }
+            },
+            {
+                name: "VORTEX",
+                color: "#0055ff", // Royal Blue
+                gen: (i) => {
+                    const r=2+Math.random()*25, t=i*0.15, y=(Math.random()-0.5)*60;
+                    return {x:r*Math.cos(t), y:y, z:r*Math.sin(t)};
+                }
+            }
+        ];
+
+        function applyShape(idx) {
+            const shape = SHAPES[idx % SHAPES.length];
+            const color = new THREE.Color(shape.color);
+            
+            // 1. Set Targets
+            for(let i=0; i<CONFIG.count; i++){
+                const p = shape.gen(i);
+                physics[i].tx = p.x; physics[i].ty = p.y; physics[i].tz = p.z;
+                
+                // 2. Set SOLID Color (Monochromatic)
+                col[i*3] = color.r; col[i*3+1] = color.g; col[i*3+2] = color.b;
+            }
+            geo.attributes.color.needsUpdate = true;
+            
+            // 3. UI Update
+            DOM.status.innerText = `MORPH: ${shape.name}`;
+            DOM.status.style.borderColor = shape.color;
+            DOM.status.style.color = shape.color;
+            
+            DOM.centerText.innerText = shape.name;
+            DOM.centerText.style.color = shape.color;
+            DOM.centerText.style.textShadow = `0 0 50px ${shape.color}`;
+            
+            DOM.centerPop.style.display = 'block';
+            setTimeout(() => DOM.centerPop.style.display='none', 1000);
+        }
+
+        // --- 4. INPUTS ---
+        window.addEventListener('mousedown', e => { STATE.mouse.down=true; STATE.mouse.x=e.clientX; STATE.mouse.y=e.clientY; STATE.autoRotate=false; });
+        window.addEventListener('mouseup', () => STATE.mouse.down=false);
+        window.addEventListener('mousemove', e => {
+            if(STATE.mouse.down) {
+                const dx = e.clientX - STATE.mouse.x;
+                const dy = e.clientY - STATE.mouse.y;
+                STATE.mouse.vx = dx * 0.005;
+                STATE.mouse.vy = dy * 0.005;
+                points.rotation.y += STATE.mouse.vx;
+                points.rotation.x += STATE.mouse.vy;
+                STATE.mouse.x = e.clientX; STATE.mouse.y = e.clientY;
+            }
+        });
+        window.addEventListener('wheel', e => {
+            STATE.targetZoom += e.deltaY * 0.05;
+            STATE.targetZoom = Math.max(10, Math.min(200, STATE.targetZoom));
+        });
+
+        // --- 5. VISION ---
+        let handLandmarker;
+        async function init() {
+            DOM.btn.innerText = "STARTING NEURAL NET...";
+            try {
+                const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm");
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+                    runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: 0.3
+                });
+                
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                DOM.vid.srcObject = stream;
+                DOM.vid.onloadeddata = () => {
+                    DOM.loader.style.display = 'none';
+                    DOM.hud.width = window.innerWidth;
+                    DOM.hud.height = window.innerHeight;
+                    applyShape(0); // Init Galaxy
+                    animate();
+                };
+            } catch(e) { DOM.err.innerText = e.message; }
+        }
+
+        // --- 6. ANIMATION ---
+        let lastTime = -1;
+        function animate() {
+            // A. Vision
+            if (DOM.vid.readyState >= 2 && DOM.vid.currentTime !== lastTime) {
+                lastTime = DOM.vid.currentTime;
+                const res = handLandmarker.detectForVideo(DOM.vid, performance.now());
+                handleGestures(res);
+            }
+
+            // B. Physics
+            STATE.zoom += (STATE.targetZoom - STATE.zoom) * 0.1;
+            camera.position.z = STATE.zoom;
+
+            if(!STATE.mouse.down) {
+                if(STATE.autoRotate) points.rotation.y += 0.001;
+                else {
+                    STATE.mouse.vx *= 0.95; STATE.mouse.vy *= 0.95;
+                    points.rotation.y += STATE.mouse.vx; points.rotation.x += STATE.mouse.vy;
+                    if(Math.abs(STATE.mouse.vx) < 0.0001) STATE.autoRotate = true;
+                }
+            }
+
+            const arr = geo.attributes.position.array;
+            for(let i=0; i<CONFIG.count; i++){
+                const p = physics[i];
+                const idx = i*3;
+                let tx=p.tx, ty=p.ty, tz=p.tz;
+                if(STATE.isImploding) { tx=0; ty=0; tz=0; }
+                
+                p.vx += (tx - arr[idx]) * 0.06;
+                p.vy += (ty - arr[idx+1]) * 0.06;
+                p.vz += (tz - arr[idx+2]) * 0.06;
+                p.vx *= 0.88; p.vy *= 0.88; p.vz *= 0.88;
+
+                arr[idx] += p.vx; arr[idx+1] += p.vy; arr[idx+2] += p.vz;
+            }
+            geo.attributes.position.needsUpdate = true;
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        function handleGestures(res) {
+            const ctx = DOM.ctx;
+            ctx.clearRect(0,0,DOM.hud.width, DOM.hud.height);
+            const toScreen = (pt) => ({ x: (1-pt.x)*DOM.hud.width, y: pt.y*DOM.hud.height });
+
+            // Debug Skeletons
+            res.landmarks.forEach(h => {
+                const p = h.map(pt => toScreen(pt));
+                ctx.strokeStyle = '#00ffcc'; ctx.lineWidth = 2; ctx.beginPath();
+                ctx.moveTo(p[0].x, p[0].y); ctx.lineTo(p[8].x, p[8].y); ctx.stroke();
+                ctx.moveTo(p[0].x, p[0].y); ctx.lineTo(p[4].x, p[4].y); ctx.stroke();
+            });
+
+            if (res.landmarks.length === 2) {
+                // ZOOM
+                STATE.autoRotate = false;
+                const h1 = res.landmarks[0][0]; const h2 = res.landmarks[1][0];
+                const dist = Math.hypot(h1.x - h2.x, h1.y - h2.y);
+                let z = Math.max(0, Math.min(1, (dist - 0.1) / 0.6));
+                STATE.targetZoom = 120 - (z * 110);
+            } else if (res.landmarks.length === 1) {
+                // PINCH
+                const lm = res.landmarks[0];
+                const pinch = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                const pCenter = toScreen(lm[8]);
+                
+                // Ring Graphic
+                ctx.strokeStyle='white'; ctx.beginPath(); ctx.arc(pCenter.x, pCenter.y, 30, 0, 6.28); ctx.stroke();
+
+                if (pinch < 0.05) {
+                    STATE.pinchVal += 0.05;
+                    ctx.fillStyle='#00ffcc'; ctx.beginPath(); ctx.arc(pCenter.x, pCenter.y, 25, 0, 6.28*STATE.pinchVal); ctx.fill();
+                    
+                    if(STATE.pinchVal >= 1) {
+                        STATE.pinchVal = 0;
+                        STATE.shapeIdx = (STATE.shapeIdx + 1) % SHAPES.length;
+                        applyShape(STATE.shapeIdx);
+                    }
+                } else STATE.pinchVal=0;
+
+                // FIST
+                const fist = Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y);
+                STATE.isImploding = fist < 0.15;
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            DOM.hud.width = window.innerWidth;
+            DOM.hud.height = window.innerHeight;
+        });
+
+        DOM.btn.addEventListener('click', init);
+    </script>
+</body>
+</html>
